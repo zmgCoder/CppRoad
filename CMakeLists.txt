@@ -21,6 +21,9 @@ set(SOURCES
 # 头文件
 set(HEADERS
     http_server.hpp
+    templates.hpp
+    routes.hpp
+    server_manager.hpp
 )
 
 # 创建可执行文件

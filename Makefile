@@ -10,7 +10,7 @@ TARGET = http_server
 
 # 源文件
 SOURCES = main.cpp http_server.cpp
-HEADERS = http_server.hpp
+HEADERS = http_server.hpp templates.hpp routes.hpp server_manager.hpp
 
 # 对象文件
 OBJECTS = $(SOURCES:.cpp=.o)
