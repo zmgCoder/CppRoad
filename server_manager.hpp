@@ -111,10 +111,11 @@ namespace server {
          * 信号处理函数
          */
         static void signal_handler(int signal) {
+            std::cout << "\n🛑 收到退出信号 (" << signal << ")..." << std::endl;
             if (instance_) {
                 instance_->stop();
             }
-            exit(0);
+            // 不要直接调用exit()，让程序自然退出
         }
         
         /**

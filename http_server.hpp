@@ -61,6 +61,7 @@ private:
     void setup_socket();
     void accept_connections();
     void handle_client(int client_socket);
+    void cleanup_completed_threads();
     Request parse_request(const std::string& raw_request);
     Response handle_request(const Request& request);
     std::string create_handler_key(const std::string& method, const std::string& path);

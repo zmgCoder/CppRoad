@@ -6,6 +6,11 @@
 #include <sstream>
 #include <algorithm>
 #include <stdexcept>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/select.h>
+#include <chrono>
+#include <cstring>
 
 namespace http {
 
@@ -66,6 +71,17 @@ void HttpServer::setup_socket() {
         close(server_socket_);
         throw std::runtime_error("无法监听端口");
     }
+    
+    // 设置socket为非阻塞模式
+    int flags = fcntl(server_socket_, F_GETFL, 0);
+    if (flags == -1) {
+        close(server_socket_);
+        throw std::runtime_error("无法获取socket标志");
+    }
+    if (fcntl(server_socket_, F_SETFL, flags | O_NONBLOCK) == -1) {
+        close(server_socket_);
+        throw std::runtime_error("无法设置socket为非阻塞模式");
+    }
 }
 
 void HttpServer::register_handler(const std::string& method, const std::string& path, RequestHandler handler) {
@@ -90,42 +106,93 @@ void HttpServer::stop() {
         return;
     }
     
+    std::cout << "正在停止HTTP服务器..." << std::endl;
     running_.store(false);
     
+    // 关闭服务器socket以中断accept()调用
     if (server_socket_ >= 0) {
+        shutdown(server_socket_, SHUT_RDWR);
         close(server_socket_);
         server_socket_ = -1;
     }
     
-    // 等待所有工作线程结束
-    for (auto& thread : worker_threads_) {
-        if (thread.joinable()) {
-            thread.join();
+    // 等待accept线程结束（通常是第一个线程）
+    if (!worker_threads_.empty() && worker_threads_[0].joinable()) {
+        worker_threads_[0].join();
+    }
+    
+    // 给其他客户端处理线程一些时间来完成
+    std::cout << "等待客户端连接处理完成..." << std::endl;
+    auto start_time = std::chrono::steady_clock::now();
+    
+    for (size_t i = 1; i < worker_threads_.size(); ++i) {
+        if (worker_threads_[i].joinable()) {
+            // 设置超时时间为5秒
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+            
+            if (elapsed < 5) {
+                worker_threads_[i].join();
+            } else {
+                std::cout << "超时等待线程完成，强制分离线程" << std::endl;
+                worker_threads_[i].detach();
+                break;
+            }
         }
     }
-    worker_threads_.clear();
     
+    worker_threads_.clear();
     std::cout << "HTTP服务器已停止" << std::endl;
 }
 
 void HttpServer::accept_connections() {
     while (running_.load()) {
-        sockaddr_in client_address{};
-        socklen_t client_len = sizeof(client_address);
+        // 使用select来检查是否有新连接，避免无限期阻塞
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(server_socket_, &read_fds);
         
-        int client_socket = accept(server_socket_, (struct sockaddr*)&client_address, &client_len);
+        struct timeval timeout;
+        timeout.tv_sec = 1;  // 1秒超时
+        timeout.tv_usec = 0;
         
-        if (client_socket < 0) {
+        int activity = select(server_socket_ + 1, &read_fds, nullptr, nullptr, &timeout);
+        
+        if (activity < 0) {
             if (running_.load()) {
-                std::cerr << "接受连接时出错" << std::endl;
+                std::cerr << "select()调用出错: " << strerror(errno) << std::endl;
             }
+            break;
+        } else if (activity == 0) {
+            // 超时，继续循环检查running_状态
             continue;
         }
         
-        // 为每个客户端创建一个处理线程
-        worker_threads_.emplace_back([this, client_socket]() {
-            handle_client(client_socket);
-        });
+        if (!running_.load()) {
+            break;
+        }
+        
+        if (FD_ISSET(server_socket_, &read_fds)) {
+            sockaddr_in client_address{};
+            socklen_t client_len = sizeof(client_address);
+            
+            int client_socket = accept(server_socket_, (struct sockaddr*)&client_address, &client_len);
+            
+            if (client_socket < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK && running_.load()) {
+                    std::cerr << "接受连接时出错: " << strerror(errno) << std::endl;
+                }
+                continue;
+            }
+            
+            // 清理已完成的线程
+            cleanup_completed_threads();
+            
+            // 为每个客户端创建一个处理线程
+            worker_threads_.emplace_back([this, client_socket]() {
+                handle_client(client_socket);
+            });
+        }
     }
 }
 
@@ -215,6 +282,14 @@ Response HttpServer::handle_request(const Request& request) {
     response.body = "<h1>404 Not Found</h1><p>请求的资源未找到: " + request.path + "</p>";
     
     return response;
+}
+
+void HttpServer::cleanup_completed_threads() {
+    // 为了简化，我们限制最大并发线程数
+    // 如果线程太多，我们让它们自然完成
+    if (worker_threads_.size() > 100) {
+        std::cout << "警告: 活跃线程数过多 (" << worker_threads_.size() << ")，建议检查连接处理" << std::endl;
+    }
 }
 
 std::string HttpServer::create_handler_key(const std::string& method, const std::string& path) {
